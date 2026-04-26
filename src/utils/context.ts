@@ -53,14 +53,11 @@ export function getContextWindowForModel(
   model: string,
   betas?: string[],
 ): number {
-  // Allow override via environment variable (ant-only)
+  // Allow override via environment variable (ant-only)  # hoholiday-modify: 不再检查 ant，放开外部设置 max context
   // This takes precedence over all other context window resolution, including 1M detection,
   // so users can cap the effective context window for local decisions (auto-compact, etc.)
   // while still using a 1M-capable endpoint.
-  if (
-    process.env.USER_TYPE === 'ant' &&
-    process.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS
-  ) {
+  if (process.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS) {
     const override = parseInt(process.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, 10)
     if (!isNaN(override) && override > 0) {
       return override
@@ -206,6 +203,17 @@ export function getModelMaxOutputTokens(model: string): {
     upperLimit = cap.max_tokens
     defaultTokens = Math.min(defaultTokens, upperLimit)
   }
+
+	// hoholiday modify: 统一的环境变量覆盖层：支持“倍率修正”或“绝对值覆盖”,优先取具体的 LIMIT，其次取 DEFAULT
+	const envLimitStr = process.env.CLAUDE_CODE_MAX_OUTPUT_LIMIT || process.env.MAX_OUTPUT_TOKENS_DEFAULT
+	if (envLimitStr) {
+		const envLimit = parseInt(envLimitStr, 10)
+		if (!isNaN(envLimit) && envLimit > 0) {
+			// 将环境变量设为上限，但 default 保持在合理比例（如上限的一半）
+			defaultTokens = Math.min(defaultTokens, envLimit)
+			upperLimit = envLimit
+		}
+	}
 
   return { default: defaultTokens, upperLimit }
 }
