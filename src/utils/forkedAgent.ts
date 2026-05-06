@@ -242,7 +242,9 @@ export function extractResultText(
   if (!lastAssistantMessage) return defaultText
 
   const textContent = extractTextContent(
-    Array.isArray(lastAssistantMessage.message.content) ? lastAssistantMessage.message.content : [],
+    Array.isArray(lastAssistantMessage.message.content)
+      ? lastAssistantMessage.message.content
+      : [],
     '\n',
   )
 
@@ -374,6 +376,10 @@ export function createSubagentContext(
         }
 
   return {
+    // Preserve the parent Langfuse trace separately so nested side queries
+    // like auto_mode can attach to the main agent trace instead of the
+    // subagent's own trace.
+    langfuseRootTrace: parentContext.langfuseTrace,
     // Mutable state - cloned by default to maintain isolation
     // Clone overrides.readFileState if provided, otherwise clone from parent
     readFileState: cloneFileStateCache(
@@ -561,7 +567,10 @@ export async function runForkedAgent({
           (message as any).event?.type === 'message_delta' &&
           (message as any).event.usage
         ) {
-          const turnUsage = updateUsage({ ...EMPTY_USAGE }, (message as any).event.usage)
+          const turnUsage = updateUsage(
+            { ...EMPTY_USAGE },
+            (message as any).event.usage,
+          )
           totalUsage = accumulateUsage(totalUsage, turnUsage)
         }
         continue

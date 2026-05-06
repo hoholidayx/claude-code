@@ -146,7 +146,7 @@ export const getEmptyToolPermissionContext: () => ToolPermissionContext =
     alwaysAllowRules: {},
     alwaysDenyRules: {},
     alwaysAskRules: {},
-    isBypassPermissionsModeAvailable: false,
+    isBypassPermissionsModeAvailable: true,
   })
 
 export type CompactProgressEvent =
@@ -178,6 +178,19 @@ export type ToolUseContext = {
     querySource?: QuerySource
     /** Optional callback to get the latest tools (e.g., after MCP servers connect mid-query) */
     refreshTools?: () => Tools
+    /**
+     * @internal TEST-ONLY ESCAPE HATCH. MUST remain undefined in production.
+     *
+     * Allows non-bundled unit-test harnesses to exercise the background
+     * forked slash command path that production assistant mode gates behind
+     * `feature('KAIROS')`. Still requires `AppState.kairosEnabled`. This
+     * field is constructed in-process by trusted application code only;
+     * no external surface (MCP, plugin, slash command, network) writes to
+     * `ToolUseContext.options`. Setting this true outside a test bypasses
+     * the KAIROS feature flag; `processSlashCommand` rejects this flag
+     * outside `NODE_ENV=test`.
+     */
+    allowBackgroundForkedSlashCommands?: boolean
   }
   abortController: AbortController
   readFileState: FileStateCache
@@ -277,6 +290,8 @@ export type ToolUseContext = {
   criticalSystemReminder_EXPERIMENTAL?: string
   /** Langfuse root trace span for this query turn. Passed down to tool execution for observability. */
   langfuseTrace?: LangfuseSpan | null
+  /** Langfuse root trace span for the outer/main agent trace. Used when subagents need to nest observations under the parent agent trace. */
+  langfuseRootTrace?: LangfuseSpan | null
   /** Langfuse batch span wrapping a concurrent tool group. When set, tool observations are nested under it. */
   langfuseBatchSpan?: LangfuseSpan | null
   /** When true, preserve toolUseResult on messages even for subagents.

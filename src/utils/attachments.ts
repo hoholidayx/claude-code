@@ -18,7 +18,7 @@ import {
 import { FileTooLargeError, readFileInRange } from './readFileInRange.js'
 import { expandPath } from './path.js'
 import { countCharInString } from './stringUtils.js'
-import { count, uniq } from './array.js'
+import { uniq } from './array.js'
 import { getFsImplementation } from './fsOperations.js'
 import { readdir, stat } from 'fs/promises'
 import type { IDESelection } from '../hooks/useIdeSelection.js'
@@ -37,9 +37,7 @@ import {
 import { getPlanFilePath, getPlan } from './plans.js'
 import { getConnectedIdeName } from './ide.js'
 import {
-  filterInjectedMemoryFiles,
   getManagedAndUserConditionalRules,
-  getMemoryFiles,
   getMemoryFilesForNestedDirectory,
   getConditionalRulesForCwdLevelDirectory,
   type MemoryFileInfo,
@@ -63,7 +61,6 @@ import {
   isValidImagePaste,
 } from 'src/types/textInputTypes.js'
 import { randomUUID, type UUID } from 'crypto'
-import { getSettings_DEPRECATED } from './settings/settings.js'
 import { getSnippetForTwoFileDiff } from '@claude-code-best/builtin-tools/tools/FileEditTool/utils.js'
 import type {
   ContentBlockParam,
@@ -72,7 +69,7 @@ import type {
 } from '@anthropic-ai/sdk/resources/messages.mjs'
 import { maybeResizeAndDownsampleImageBlock } from './imageResizer.js'
 import type { PastedContent } from './config.js'
-import { getGlobalConfig } from './config.js'
+import { getSettings_DEPRECATED } from './settings/settings.js'
 import {
   getDefaultSonnetModel,
   getDefaultHaikuModel,
@@ -536,9 +533,25 @@ export type Attachment =
     }
   | {
       type: 'skill_discovery'
-      skills: { name: string; description: string; shortId?: string }[]
+      skills: {
+        name: string
+        description: string
+        shortId?: string
+        score?: number
+        autoLoaded?: boolean
+        content?: string
+        path?: string
+      }[]
       signal: DiscoverySignal
       source: 'native' | 'aki' | 'both'
+      gap?: {
+        key: string
+        status: 'pending' | 'draft' | 'active'
+        draftName?: string
+        draftPath?: string
+        activeName?: string
+        activePath?: string
+      }
     }
   | {
       type: 'queued_command'
@@ -803,11 +816,16 @@ export async function getAttachments(
         !options?.skipSkillDiscovery
           ? [
               maybe('skill_discovery', async () => {
-                const result = await skillSearchModules.prefetch.getTurnZeroSkillDiscovery(
-                  input,
-                  messages ?? [],
-                  context,
-                )
+                if (suppressNextDiscovery) {
+                  suppressNextDiscovery = false
+                  return []
+                }
+                const result =
+                  await skillSearchModules.prefetch.getTurnZeroSkillDiscovery(
+                    input,
+                    messages ?? [],
+                    context,
+                  )
                 return result ? [result] : []
               }),
             ]
@@ -996,11 +1014,13 @@ export async function getAttachments(
 
   clearTimeout(timeoutId)
   // Defensive: a getter leaking [undefined] crashes .map(a => a.type) below.
-  return ([
-    ...userAttachmentResults.flat(),
-    ...threadAttachmentResults.flat(),
-    ...mainThreadAttachmentResults.flat(),
-  ] as Attachment[]).filter(a => a !== undefined && a !== null)
+  return (
+    [
+      ...userAttachmentResults.flat(),
+      ...threadAttachmentResults.flat(),
+      ...mainThreadAttachmentResults.flat(),
+    ] as Attachment[]
+  ).filter(a => a !== undefined && a !== null)
 }
 
 async function maybe<A>(label: string, f: () => Promise<A[]>): Promise<A[]> {
@@ -1527,7 +1547,8 @@ export function getAgentListingDeltaAttachment(
     if (msg.type !== 'attachment') continue
     if (msg.attachment!.type !== 'agent_listing_delta') continue
     for (const t of msg.attachment!.addedTypes as string[]) announced.add(t)
-    for (const t of msg.attachment!.removedTypes as string[]) announced.delete(t)
+    for (const t of msg.attachment!.removedTypes as string[])
+      announced.delete(t)
   }
 
   const currentTypes = new Set(filtered.map(a => a.agentType))
@@ -1749,7 +1770,6 @@ export function memoryFilesToAttachments(
         limit: undefined,
         isPartialView: memoryFile.contentDiffersFromDisk,
       })
-
 
       // Fire InstructionsLoaded hook for audit/observability (fire-and-forget)
       if (shouldFireHook && isInstructionsMemoryType(memoryFile.type)) {
@@ -2201,6 +2221,7 @@ async function getRelevantMemoryAttachments(
   recentTools: readonly string[],
   signal: AbortSignal,
   alreadySurfaced: ReadonlySet<string>,
+  parentSpan?: unknown,
 ): Promise<Attachment[]> {
   // If an agent is @-mentioned, search only its memory dir (isolation).
   // Otherwise search the auto-memory dir.
@@ -2221,6 +2242,7 @@ async function getRelevantMemoryAttachments(
         signal,
         recentTools,
         alreadySurfaced,
+        parentSpan as Parameters<typeof findRelevantMemories>[5],
       ).catch(() => []),
     ),
   )
@@ -2257,7 +2279,11 @@ export function collectSurfacedMemories(messages: ReadonlyArray<Message>): {
   let totalBytes = 0
   for (const m of messages) {
     if (m.type === 'attachment' && m.attachment!.type === 'relevant_memories') {
-      for (const mem of m.attachment!.memories as { path: string; content: string; mtimeMs: number }[]) {
+      for (const mem of m.attachment!.memories as {
+        path: string
+        content: string
+        mtimeMs: number
+      }[]) {
         paths.add(mem.path)
         totalBytes += mem.content.length
       }
@@ -2370,6 +2396,13 @@ export function startRelevantMemoryPrefetch(
     return undefined
   }
 
+  // Poor mode: skip the side-query to save tokens
+  const { isPoorModeActive } =
+    require('../commands/poor/poorMode.js') as typeof import('../commands/poor/poorMode.js')
+  if (isPoorModeActive()) {
+    return undefined
+  }
+
   const lastUserMessage = messages.findLast(m => m.type === 'user' && !m.isMeta)
   if (!lastUserMessage) {
     return undefined
@@ -2397,6 +2430,7 @@ export function startRelevantMemoryPrefetch(
     collectRecentSuccessfulTools(messages, lastUserMessage),
     controller.signal,
     surfaced.paths,
+    toolUseContext.langfuseTrace,
   ).catch(e => {
     if (!isAbortError(e)) {
       logError(e)
@@ -2474,7 +2508,11 @@ export function collectRecentSuccessfulTools(
     if (!m) continue
     if (isHumanTurn(m) && m !== lastUserMessage) break
     if (m.type === 'assistant' && typeof m.message!.content !== 'string') {
-      for (const block of m.message!.content as Array<{type: string; id: string; name: string}>) {
+      for (const block of m.message!.content as Array<{
+        type: string
+        id: string
+        name: string
+      }>) {
         if (block.type === 'tool_use') useIdToName.set(block.id, block.name)
       }
     } else if (
@@ -2482,7 +2520,7 @@ export function collectRecentSuccessfulTools(
       'message' in m &&
       Array.isArray(m.message!.content)
     ) {
-      for (const block of m.message!.content as Array<{type: string}>) {
+      for (const block of m.message!.content as Array<{ type: string }>) {
         if (isToolResultBlock(block)) {
           resultByUseId.set(block.tool_use_id, block.is_error === true)
         }
@@ -2502,7 +2540,6 @@ export function collectRecentSuccessfulTools(
   }
   return [...succeeded].filter(t => !failed.has(t))
 }
-
 
 /**
  * Filters prefetched memory attachments to exclude memories the model already
@@ -2613,6 +2650,7 @@ const sentSkillNames = new Map<string, Set<string>>()
 export function resetSentSkillNames(): void {
   sentSkillNames.clear()
   suppressNext = false
+  suppressNextDiscovery = false
 }
 
 /**
@@ -2635,6 +2673,18 @@ export function suppressNextSkillListing(): void {
   suppressNext = true
 }
 let suppressNext = false
+
+/**
+ * Suppress the next skill-discovery injection on resume. Same rationale as
+ * suppressNextSkillListing: skill_discovery attachments are not persisted to
+ * transcript for non-ant users, so the prior process's discovery result is
+ * already in the conversation history the model sees. Re-generating it would
+ * inject duplicate content and bust the prompt cache prefix.
+ */
+export function suppressNextSkillDiscovery(): void {
+  suppressNextDiscovery = true
+}
+let suppressNextDiscovery = false
 
 // When skill-search is enabled and the filtered (bundled + MCP) listing exceeds
 // this count, fall back to bundled-only. Protects MCP-heavy users (100+ servers)
@@ -3480,7 +3530,7 @@ async function getAsyncHookResponseAttachments(): Promise<Attachment[]> {
       hookName,
       hookEvent,
       toolName,
-      pluginId,
+      pluginId: _pluginId,
       stdout,
       stderr,
       exitCode,
@@ -3982,7 +4032,6 @@ export function getContextEfficiencyAttachment(
 
   return [{ type: 'context_efficiency' }]
 }
-
 
 function isFileReadDenied(
   filePath: string,

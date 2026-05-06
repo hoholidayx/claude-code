@@ -79,10 +79,9 @@ import { isEnvTruthy } from '../utils/envUtils.js';
 import { formatTokens, truncateToWidth } from '../utils/format.js';
 import { consumeEarlyInput } from '../utils/earlyInput.js';
 import {
-  finalizeAutonomyRunCompleted,
-  finalizeAutonomyRunFailed,
-  markAutonomyRunRunning,
-} from '../utils/autonomyRuns.js';
+  claimConsumableQueuedAutonomyCommands,
+  finalizeAutonomyCommandsForTurn,
+} from '../utils/autonomyQueueLifecycle.js';
 
 import { setMemberActive } from '../utils/swarm/teamHelpers.js';
 import {
@@ -245,7 +244,14 @@ import {
   formatCommandInputTags,
 } from '../utils/messages.js';
 import { generateSessionTitle } from '../utils/sessionTitle.js';
-import { BASH_INPUT_TAG, COMMAND_MESSAGE_TAG, COMMAND_NAME_TAG, LOCAL_COMMAND_STDOUT_TAG } from '../constants/xml.js';
+import {
+  BASH_INPUT_TAG,
+  COMMAND_MESSAGE_TAG,
+  COMMAND_NAME_TAG,
+  FORK_BOILERPLATE_TAG,
+  LOCAL_COMMAND_STDOUT_TAG,
+} from '../constants/xml.js';
+import { FORK_SUBAGENT_TYPE } from '@claude-code-best/builtin-tools/tools/AgentTool/forkSubagent.js';
 import { escapeXml } from '../utils/xml.js';
 import type { ThinkingConfig } from '../utils/thinking.js';
 import { gracefulShutdownSync } from '../utils/gracefulShutdown.js';
@@ -271,7 +277,7 @@ import { useManagePlugins } from '../hooks/useManagePlugins.js';
 import { Messages } from '../components/Messages.js';
 import { TaskListV2 } from '../components/TaskListV2.js';
 import { TeammateViewHeader } from '../components/TeammateViewHeader.js';
-import { getPipeDisplayRole, getPipeIpc, isPipeControlled } from '../utils/pipeTransport.js';
+import { getPipeIpc } from '../utils/pipeTransport.js';
 import { useTasksV2WithCollapseEffect } from '../hooks/useTasksV2.js';
 import { maybeMarkProjectOnboardingComplete } from '../projectOnboardingState.js';
 import type { MCPServerConnection } from '../services/mcp/types.js';
@@ -306,8 +312,9 @@ import {
 import { deserializeMessages } from '../utils/conversationRecovery.js';
 import { extractReadFilesFromMessages, extractBashToolsFromMessages } from '../utils/queryHelpers.js';
 import { resetMicrocompactState } from '../services/compact/microCompact.js';
-import { runPostCompactCleanup } from '../services/compact/postCompactCleanup.js';
+import { runPostCompactCleanup, registerCompactCleanup } from '../services/compact/postCompactCleanup.js';
 import {
+  createContentReplacementState,
   provisionContentReplacementState,
   reconstructContentReplacementState,
   type ContentReplacementRecord,
@@ -336,6 +343,7 @@ import {
 import { isBgSession, updateSessionName, updateSessionActivity } from '../utils/concurrentSessions.js';
 import { isInProcessTeammateTask, type InProcessTeammateTaskState } from '../tasks/InProcessTeammateTask/types.js';
 import { restoreRemoteAgentTasks } from '../tasks/RemoteAgentTask/RemoteAgentTask.js';
+import { BackgroundAgentSelector } from '../components/tasks/BackgroundAgentSelector.js';
 import { useInboxPoller } from '../hooks/useInboxPoller.js';
 // Dead code elimination: conditional import for loop mode
 /* eslint-disable @typescript-eslint/no-require-imports */
@@ -422,9 +430,7 @@ import { usePromptsFromClaudeInChrome } from 'src/hooks/usePromptsFromClaudeInCh
 import { getTipToShowOnSpinner, recordShownTip } from 'src/services/tips/tipScheduler.js';
 import type { Theme } from 'src/utils/theme.js';
 import {
-  checkAndDisableBypassPermissionsIfNeeded,
   checkAndDisableAutoModeIfNeeded,
-  useKickOffCheckAndDisableBypassPermissionsIfNeeded,
   useKickOffCheckAndDisableAutoModeIfNeeded,
 } from 'src/utils/permissions/bypassPermissionsKillswitch.js';
 import { SandboxManager } from 'src/utils/sandbox/sandbox-adapter.js';
@@ -434,7 +440,6 @@ import { SandboxPermissionRequest } from 'src/components/permissions/SandboxPerm
 import { SandboxViolationExpandedView } from 'src/components/SandboxViolationExpandedView.js';
 import { useSettingsErrors } from 'src/hooks/notifs/useSettingsErrors.js';
 import { useMcpConnectivityStatus } from 'src/hooks/notifs/useMcpConnectivityStatus.js';
-import { useAutoModeUnavailableNotification } from 'src/hooks/notifs/useAutoModeUnavailableNotification.js';
 import { AUTO_MODE_DESCRIPTION } from 'src/components/AutoModeOptInDialog.js';
 import { useLspInitializationNotification } from 'src/hooks/notifs/useLspInitializationNotification.js';
 import { useLspPluginRecommendation } from 'src/hooks/useLspPluginRecommendation.js';
@@ -467,11 +472,8 @@ import {
 } from '../utils/autoRunIssue.js';
 import type { HookProgress } from '../types/hooks.js';
 import { TungstenLiveMonitor } from '@claude-code-best/builtin-tools/tools/TungstenTool/TungstenLiveMonitor.js';
-/* eslint-disable @typescript-eslint/no-require-imports */
-const WebBrowserPanelModule = feature('WEB_BROWSER_TOOL')
-  ? (require('@claude-code-best/builtin-tools/tools/WebBrowserTool/WebBrowserPanel.js') as typeof import('@claude-code-best/builtin-tools/tools/WebBrowserTool/WebBrowserPanel.js'))
-  : null;
-/* eslint-enable @typescript-eslint/no-require-imports */
+// WebBrowserPanel removed — browser-lite returns results inline via tool_result.
+// For full browser interaction use Claude-in-Chrome MCP tools.
 import { IssueFlagBanner } from '../components/PromptInput/IssueFlagBanner.js';
 import { useIssueFlagBanner } from '../hooks/useIssueFlagBanner.js';
 import { CompanionSprite, CompanionFloatingBubble, MIN_COLS_FOR_FULL_SPRITE } from '../buddy/CompanionSprite.js';
@@ -645,6 +647,7 @@ function TranscriptSearchBar({
   const [indexStatus, setIndexStatus] = React.useState<'building' | { ms: number } | null>('building');
   React.useEffect(() => {
     let alive = true;
+    let hideTimeout: ReturnType<typeof setTimeout> | undefined;
     const warm = jumpRef.current?.warmSearchIndex;
     if (!warm) {
       setIndexStatus(null); // VML not mounted yet — rare, skip indicator
@@ -658,14 +661,14 @@ function TranscriptSearchBar({
         setIndexStatus(null);
       } else {
         setIndexStatus({ ms });
-        setTimeout(() => alive && setIndexStatus(null), 2000);
+        hideTimeout = setTimeout(() => alive && setIndexStatus(null), 2000);
       }
     });
     return () => {
       alive = false;
+      if (hideTimeout) clearTimeout(hideTimeout);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []); // mount-only: bar opens once per /
+  }, [jumpRef]); // mount-only per stable search bar ref
   // Gate the query effect on warm completion. setHighlight stays instant
   // (screen-space overlay, no indexing). setSearchQuery (the scan) waits.
   const warmDone = indexStatus !== 'building';
@@ -673,8 +676,7 @@ function TranscriptSearchBar({
     if (!warmDone) return;
     jumpRef.current?.setSearchQuery(query);
     setHighlight(query);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [query, warmDone]);
+  }, [jumpRef, query, setHighlight, warmDone]);
   const off = cursorOffset;
   const cursorChar = off < query.length ? query[off] : ' ';
   return (
@@ -806,6 +808,21 @@ export type Props = {
 
 export type Screen = 'prompt' | 'transcript';
 
+// Boilerplate carrier lives in a mixed user message ([tool_result..., text])
+// that AgentTool/forkSubagent.buildForkedMessages emits as the fork child's
+// first user turn. The text block wraps <FORK_BOILERPLATE_TAG>...</..> + the
+// user prompt; tool_result siblings keep the parent's tool calls closed.
+const FORK_BOILERPLATE_OPEN_TAG = `<${FORK_BOILERPLATE_TAG}>`;
+
+function isForkBoilerplateTextBlock(block: { type: string; text?: string }): boolean {
+  return block.type === 'text' && typeof block.text === 'string' && block.text.includes(FORK_BOILERPLATE_OPEN_TAG);
+}
+
+function isForkBoilerplateMessage(message: MessageType): boolean {
+  if (message.type !== 'user' || !Array.isArray(message.message?.content)) return false;
+  return message.message.content.some(isForkBoilerplateTextBlock);
+}
+
 export function REPL({
   commands: initialCommands,
   debug,
@@ -814,8 +831,8 @@ export function REPL({
   pendingHookMessages,
   initialFileHistorySnapshots,
   initialContentReplacements,
-  initialAgentName,
-  initialAgentColor,
+  initialAgentName: _initialAgentName,
+  initialAgentColor: _initialAgentColor,
   mcpClients: initialMcpClients,
   dynamicMcpConfig: initialDynamicMcpConfig,
   autoConnectIdeFlag,
@@ -948,7 +965,6 @@ export function REPL({
     [toolPermissionContext, proactiveActive, isBriefOnly],
   );
 
-  useKickOffCheckAndDisableBypassPermissionsIfNeeded();
   useKickOffCheckAndDisableAutoModeIfNeeded();
 
   const [dynamicMcpConfig, setDynamicMcpConfig] = useState<Record<string, ScopedMcpServerConfig> | undefined>(
@@ -1006,7 +1022,6 @@ export function REPL({
   useCanSwitchToExistingSubscription();
   useIDEStatusIndicator({ ideSelection, mcpClients, ideInstallationStatus });
   useMcpConnectivityStatus({ mcpClients });
-  useAutoModeUnavailableNotification();
   usePluginInstallationStatus();
   usePluginAutoupdateNotification();
   useSettingsErrors();
@@ -1574,7 +1589,15 @@ export function REPL({
   // Deferred messages for the Messages component — renders at transition
   // priority so the reconciler yields every 5ms, keeping input responsive
   // while the expensive message processing pipeline runs.
-  const deferredMessages = useDeferredValue(messages);
+  // Cap at 500 messages to limit memory double-buffering. The bypass
+  // at display-time uses sync messages during streaming and non-loading,
+  // so this cap only affects reduced-motion scenarios.
+  const DEFERRED_CAP = 500;
+  const cappedMessages = React.useMemo(
+    () => (messages.length > DEFERRED_CAP ? messages.slice(-DEFERRED_CAP) : messages),
+    [messages],
+  );
+  const deferredMessages = useDeferredValue(cappedMessages);
   const deferredBehind = messages.length - deferredMessages.length;
   if (deferredBehind > 0) {
     logForDebugging(
@@ -1787,6 +1810,9 @@ export function REPL({
   const [contentReplacementStateRef] = useState(() => ({
     current: provisionContentReplacementState(initialMessages, initialContentReplacements),
   }));
+  registerCompactCleanup(() => {
+    contentReplacementStateRef.current = createContentReplacementState();
+  });
 
   const [haveShownCostDialog, setHaveShownCostDialog] = useState(getGlobalConfig().hasAcknowledgedCostThreshold);
   const [vimMode, setVimMode] = useState<VimMode>('INSERT');
@@ -2794,7 +2820,7 @@ export function REPL({
   const getToolUseContext = useCallback(
     (
       messages: MessageType[],
-      newMessages: MessageType[],
+      _newMessages: MessageType[],
       abortController: AbortController,
       mainLoopModel: string,
     ): ProcessUserInputContext => {
@@ -3059,12 +3085,23 @@ export function REPL({
             // are O(n) per render, so drop everything before the previous
             // boundary to keep n bounded across multi-day sessions.
             if (isFullscreenEnvEnabled()) {
-              setMessages(old => [
-                ...getMessagesAfterCompactBoundary(old, {
+              setMessages(old => {
+                const postBoundary = getMessagesAfterCompactBoundary(old, {
                   includeSnipped: true,
-                }),
-                newMessage,
-              ]);
+                });
+                // Hard cap: keep at most 500 messages in fullscreen scrollback
+                // to prevent unbounded memory growth in multi-day sessions.
+                // normalizeMessages/applyGrouping are O(n), and Ink fiber
+                // trees cost ~250KB RSS per message. Without this cap,
+                // scrollback after several compactions can reach thousands
+                // of messages (observed: 13k+, 1GB+ heap).
+                const MAX_FULLSCREEN_SCROLLBACK = 500;
+                const kept =
+                  postBoundary.length > MAX_FULLSCREEN_SCROLLBACK
+                    ? postBoundary.slice(-MAX_FULLSCREEN_SCROLLBACK)
+                    : postBoundary;
+                return [...kept, newMessage];
+              });
             } else {
               setMessages(() => [newMessage]);
             }
@@ -3090,17 +3127,20 @@ export function REPL({
             // history). Replacing those leaves the AgentTool UI stuck at
             // "Initializing…" because it renders the full progress trail.
             setMessages(oldMessages => {
-              const last = oldMessages.at(-1);
-              const lastData = last?.data as Record<string, unknown> | undefined;
               const newData = newMessage.data as Record<string, unknown>;
-              if (
-                last?.type === 'progress' &&
-                last.parentToolUseID === newMessage.parentToolUseID &&
-                lastData?.type === newData.type
-              ) {
-                const copy = oldMessages.slice();
-                copy[copy.length - 1] = newMessage;
-                return copy;
+              // Scan backwards to find the last ephemeral progress with matching
+              // parentToolUseID and type. Previously only checked the last message,
+              // so interleaved non-ephemeral messages caused duplicate progress
+              // entries to accumulate (observed 13k+ entries in sleep-heavy sessions).
+              for (let i = oldMessages.length - 1; i >= 0; i--) {
+                const m = oldMessages[i]!;
+                if (m.type !== 'progress') break;
+                const mData = m.data as Record<string, unknown> | undefined;
+                if (m.parentToolUseID === newMessage.parentToolUseID && mData?.type === newData.type) {
+                  const copy = oldMessages.slice();
+                  copy[i] = newMessage;
+                  return copy;
+                }
               }
               return [...oldMessages, newMessage];
             });
@@ -3314,8 +3354,8 @@ export function REPL({
       queryCheckpoint('query_context_loading_start');
       const [, , defaultSystemPrompt, baseUserContext, systemContext] = await Promise.all([
         // IMPORTANT: do this after setMessages() above, to avoid UI jank
-        checkAndDisableBypassPermissionsIfNeeded(toolPermissionContext, setAppState),
-        // Gated on TRANSCRIPT_CLASSIFIER so GrowthBook kill switch runs wherever auto mode is built in
+        undefined,
+        // Fast-mode circuit breaker check
         feature('TRANSCRIPT_CLASSIFIER')
           ? checkAndDisableAutoModeIfNeeded(toolPermissionContext, setAppState, store.getState().fastMode)
           : undefined,
@@ -3469,7 +3509,7 @@ export function REPL({
       onBeforeQueryCallback?: (input: string, newMessages: MessageType[]) => Promise<boolean>,
       input?: string,
       effort?: EffortValue,
-    ): Promise<void> => {
+    ): Promise<boolean> => {
       // If this is a teammate, mark them as active when starting a turn
       if (isAgentSwarmsEnabled()) {
         const teamName = getTeamName();
@@ -3500,7 +3540,7 @@ export function REPL({
               logEvent('tengu_concurrent_onquery_enqueued', {});
             }
           });
-        return;
+        return false;
       }
 
       try {
@@ -3533,7 +3573,7 @@ export function REPL({
         if (onBeforeQueryCallback && input) {
           const shouldProceed = await onBeforeQueryCallback(input, latestMessages);
           if (!shouldProceed) {
-            return;
+            return true;
           }
         }
 
@@ -3682,6 +3722,7 @@ export function REPL({
           }
         }
       }
+      return true;
     },
     [onQueryImpl, setAppState, resetLoadingState, queryGuard, mrOnBeforeQuery, mrOnTurnComplete],
   );
@@ -4836,44 +4877,62 @@ export function REPL({
             } satisfies QueuedCommand)
           : input;
 
-      const newAbortController = createAbortController();
-      setAbortController(newAbortController);
+      void (async () => {
+        const claim = await claimConsumableQueuedAutonomyCommands([queuedCommand]);
+        const command = claim.attachmentCommands[0];
+        if (!command) return;
 
-      // Create a user message with the formatted content (includes XML wrapper)
-      const userMessage = createUserMessage({
-        content: queuedCommand.value as string,
-        isMeta: queuedCommand.isMeta ? true : undefined,
-        origin: queuedCommand.origin,
-      });
+        const newAbortController = createAbortController();
+        setAbortController(newAbortController);
 
-      const autonomyRunId = queuedCommand.autonomy?.runId;
-      if (autonomyRunId) {
-        void markAutonomyRunRunning(autonomyRunId);
-      }
+        // Create a user message with the formatted content (includes XML wrapper)
+        const userMessage = createUserMessage({
+          content: command.value,
+          isMeta: command.isMeta ? true : undefined,
+          origin: command.origin,
+        });
 
-      void onQuery([userMessage], newAbortController, true, [], mainLoopModel)
-        .then(() => {
-          if (autonomyRunId) {
-            void finalizeAutonomyRunCompleted({
-              runId: autonomyRunId,
+        let executed = false;
+        try {
+          executed = (await onQuery([userMessage], newAbortController, true, [], mainLoopModel)) !== false;
+        } catch (error: unknown) {
+          try {
+            await finalizeAutonomyCommandsForTurn({
+              commands: claim.claimedCommands,
+              outcome: { type: 'failed', error },
               currentDir: getCwd(),
               priority: 'later',
-            }).then(nextCommands => {
-              for (const command of nextCommands) {
-                enqueue(command);
-              }
             });
-          }
-        })
-        .catch((error: unknown) => {
-          if (autonomyRunId) {
-            void finalizeAutonomyRunFailed({
-              runId: autonomyRunId,
-              error: String(error),
-            });
+          } catch (finalizeError: unknown) {
+            logError(toError(finalizeError));
           }
           logError(toError(error));
-        });
+          return;
+        }
+
+        // Only finalize as completed when onQuery actually executed the turn
+        // (it returns false from the concurrent-guard path without running).
+        // Keep this finalize in its own try/catch so a failure here does not
+        // trigger a second finalize as `failed` for the same commands.
+        if (!executed) {
+          return;
+        }
+        try {
+          const nextCommands = await finalizeAutonomyCommandsForTurn({
+            commands: claim.claimedCommands,
+            outcome: { type: 'completed' },
+            currentDir: getCwd(),
+            priority: 'later',
+          });
+          for (const nextCommand of nextCommands) {
+            enqueue(nextCommand);
+          }
+        } catch (finalizeError: unknown) {
+          logError(toError(finalizeError));
+        }
+      })().catch((error: unknown) => {
+        logError(toError(error));
+      });
       return true;
     },
     [onQuery, mainLoopModel, store],
@@ -4901,7 +4960,7 @@ export function REPL({
   useMailboxBridge({ isLoading, onSubmitMessage: handleIncomingPrompt });
   useMasterMonitor();
   useSlaveNotifications();
-  const pipeIpcState = useAppState(s => getPipeIpc(s as any));
+  const _pipeIpcState = useAppState(s => getPipeIpc(s as any));
 
   usePipePermissionForward({ store, tools, setMessages, setToolUseConfirmQueue, getToolUseContext, mainLoopModel });
   usePipeMuteSync({ setToolUseConfirmQueue });
@@ -5000,16 +5059,19 @@ export function REPL({
     }
   }, [queuedCommands]);
 
+  const onInitRef = useRef(onInit);
+  onInitRef.current = onInit;
+  const diagnosticTrackerRef = useRef(diagnosticTracker);
+  diagnosticTrackerRef.current = diagnosticTracker;
+
   // Initial load
   useEffect(() => {
-    void onInit();
+    void onInitRef.current();
 
     // Cleanup on unmount
     return () => {
-      void diagnosticTracker.shutdown();
+      void diagnosticTrackerRef.current.shutdown();
     };
-    // TODO: fix this
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Listen for suspend/resume events
@@ -5509,8 +5571,72 @@ export function REPL({
   const usesSyncMessages = showStreamingText || !isLoading;
   // When viewing an agent, never fall through to leader — empty until
   // bootstrap/stream fills. Closes the see-leader-type-agent footgun.
+  const rawAgentMessages = viewedAgentTask?.messages;
+  // Fork sidechain encodes the user prompt inside a mixed user message alongside
+  // tool_result blocks; surface the prompt as a standalone bubble and strip the
+  // boilerplate text from its original carrier while preserving tool_results.
+  const displayedAgentMessages = useMemo(() => {
+    if (!viewedAgentTask) return undefined;
+    const agentMessages = rawAgentMessages ?? [];
+    if (
+      !isLocalAgentTask(viewedAgentTask) ||
+      viewedAgentTask.agentType !== FORK_SUBAGENT_TYPE ||
+      !viewedAgentTask.prompt
+    ) {
+      return agentMessages;
+    }
+    // Single pass: locate boilerplate carrier, check whether the prompt text is
+    // already present elsewhere, and find the fallback insertion point (after
+    // the last parent assistant tool_use).
+    const trimmedPrompt = viewedAgentTask.prompt.trim();
+    let boilerplateIndex = -1;
+    let lastAssistantToolUseIndex = -1;
+    let promptAlreadyRendered = false;
+    for (let i = 0; i < agentMessages.length; i++) {
+      const m = agentMessages[i]!;
+      if (m.type === 'user' && Array.isArray(m.message?.content)) {
+        const hasBoilerplate = m.message.content.some(isForkBoilerplateTextBlock);
+        if (hasBoilerplate) {
+          boilerplateIndex = i;
+        } else if (!promptAlreadyRendered) {
+          const firstText = m.message.content.find(b => b.type === 'text' && typeof b.text === 'string') as
+            | { type: 'text'; text: string }
+            | undefined;
+          if (firstText && firstText.text.trim() === trimmedPrompt) promptAlreadyRendered = true;
+        }
+        continue;
+      }
+      if (m.type === 'assistant' && Array.isArray(m.message?.content)) {
+        if (m.message.content.some(b => b.type === 'tool_use')) lastAssistantToolUseIndex = i;
+      }
+    }
+
+    const stripped =
+      boilerplateIndex === -1
+        ? agentMessages
+        : agentMessages.map((m, i) => {
+            if (i !== boilerplateIndex) return m;
+            if (!Array.isArray(m.message?.content)) return m;
+            return {
+              ...m,
+              message: {
+                ...m.message,
+                content: m.message.content.filter(b => !isForkBoilerplateTextBlock(b)),
+              },
+            };
+          });
+
+    if (promptAlreadyRendered) return stripped;
+
+    const insertAt = boilerplateIndex !== -1 ? boilerplateIndex + 1 : lastAssistantToolUseIndex + 1;
+    const synthetic = createUserMessage({
+      content: viewedAgentTask.prompt,
+      timestamp: new Date(viewedAgentTask.startTime).toISOString(),
+    });
+    return [...stripped.slice(0, insertAt), synthetic, ...stripped.slice(insertAt)];
+  }, [viewedAgentTask, rawAgentMessages]);
   const displayedMessages = viewedAgentTask
-    ? (viewedAgentTask.messages ?? [])
+    ? (displayedAgentMessages ?? [])
     : usesSyncMessages
       ? messages
       : deferredMessages;
@@ -5673,7 +5799,7 @@ export function REPL({
                 </Box>
               )}
               {process.env.USER_TYPE === 'ant' && <TungstenLiveMonitor />}
-              {feature('WEB_BROWSER_TOOL') ? WebBrowserPanelModule && <WebBrowserPanelModule.WebBrowserPanel /> : null}
+              {/* WebBrowserPanel removed — browser-lite, no panel */}
               <Box flexGrow={1} />
               {showSpinner && (
                 <SpinnerWithVerb
@@ -6186,8 +6312,8 @@ export function REPL({
                         setInputValue={setInputValue}
                       />
                     )}
-                    {/* Skill improvement survey - appears when improvements detected (ant-only) */}
-                    {process.env.USER_TYPE === 'ant' && skillImprovementSurvey.suggestion && (
+                    {/* Skill improvement survey - appears when improvements detected */}
+                    {skillImprovementSurvey.suggestion && (
                       <SkillImprovementSurvey
                         isOpen={skillImprovementSurvey.isOpen}
                         skillName={skillImprovementSurvey.suggestion.skillName}
@@ -6247,6 +6373,7 @@ export function REPL({
                       voiceInterimRange={voice.interimRange}
                     />
                     <SessionBackgroundHint onBackgroundSession={handleBackgroundSession} isLoading={isLoading} />
+                    <BackgroundAgentSelector />
                   </>
                 )}
                 {cursor && (

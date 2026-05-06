@@ -42,7 +42,10 @@ export async function* adaptOpenAIStreamToAnthropic(
   let currentContentIndex = -1
 
   // Track tool_use blocks: tool_calls index → { contentIndex, id, name, arguments }
-  const toolBlocks = new Map<number, { contentIndex: number; id: string; name: string; arguments: string }>()
+  const toolBlocks = new Map<
+    number,
+    { contentIndex: number; id: string; name: string; arguments: string }
+  >()
 
   // Track thinking block state
   let thinkingBlockOpen = false
@@ -103,9 +106,13 @@ export async function* adaptOpenAIStreamToAnthropic(
     // Skip chunks that carry only usage data (no delta content)
     if (!delta) continue
 
-    // Handle reasoning_content → Anthropic thinking block
+    // Handle reasoning_content → Anthropic thinking block.
+    // Empty string is a valid signal: DeepSeek v4 thinking mode sometimes
+    // returns reasoning_content: "" when the model answers directly. The
+    // empty thinking block must round-trip back to the API in subsequent
+    // requests, otherwise DeepSeek rejects with 400.
     const reasoningContent = (delta as any).reasoning_content
-    if (reasoningContent != null && reasoningContent !== '') {
+    if (reasoningContent != null) {
       if (!thinkingBlockOpen) {
         currentContentIndex++
         thinkingBlockOpen = true
@@ -122,14 +129,16 @@ export async function* adaptOpenAIStreamToAnthropic(
         } as BetaRawMessageStreamEvent
       }
 
-      yield {
-        type: 'content_block_delta',
-        index: currentContentIndex,
-        delta: {
-          type: 'thinking_delta',
-          thinking: reasoningContent,
-        },
-      } as BetaRawMessageStreamEvent
+      if (reasoningContent !== '') {
+        yield {
+          type: 'content_block_delta',
+          index: currentContentIndex,
+          delta: {
+            type: 'thinking_delta',
+            thinking: reasoningContent,
+          },
+        } as BetaRawMessageStreamEvent
+      }
     }
 
     // Handle text content
@@ -197,7 +206,8 @@ export async function* adaptOpenAIStreamToAnthropic(
 
           // Start new tool_use block
           currentContentIndex++
-          const toolId = tc.id || `toolu_${randomUUID().replace(/-/g, '').slice(0, 24)}`
+          const toolId =
+            tc.id || `toolu_${randomUUID().replace(/-/g, '').slice(0, 24)}`
           const toolName = tc.function?.name || ''
 
           toolBlocks.set(tcIndex, {

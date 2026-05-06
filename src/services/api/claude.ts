@@ -93,6 +93,7 @@ import {
   asSystemPrompt,
   type SystemPrompt,
 } from '../../utils/systemPromptType.js'
+import { cloneDeep } from 'lodash-es'
 import { tokenCountFromLastAPIResponse } from '../../utils/tokens.js'
 import { getDynamicConfig_BLOCKS_ON_INIT } from '../analytics/growthbook.js'
 import {
@@ -101,6 +102,8 @@ import {
   extractQuotaStatusFromHeaders,
 } from '../claudeAiLimits.js'
 import { getAPIContextManagement } from '../compact/apiMicrocompact.js'
+import { bedrockAdapter } from '../providerUsage/adapters/bedrock.js'
+import { updateProviderBuckets } from '../providerUsage/store.js'
 
 /* eslint-disable @typescript-eslint/no-require-imports */
 const autoModeStateModule = feature('TRANSCRIPT_CLASSIFIER')
@@ -118,18 +121,15 @@ import {
   getAfkModeHeaderLatched,
   getCacheEditingHeaderLatched,
   getFastModeHeaderLatched,
-  getLastApiCompletionTimestamp,
   getPromptCache1hAllowlist,
   getPromptCache1hEligible,
   getSessionId,
-  getThinkingClearLatched,
   setAfkModeHeaderLatched,
   setCacheEditingHeaderLatched,
   setFastModeHeaderLatched,
   setLastMainRequestId,
   setPromptCache1hAllowlist,
   setPromptCache1hEligible,
-  setThinkingClearLatched,
 } from 'src/bootstrap/state.js'
 import {
   AFK_MODE_BETA_HEADER,
@@ -230,7 +230,11 @@ import { getInitializationStatus } from '../lsp/manager.js'
 import { isToolFromMcpServer } from '../mcp/utils.js'
 import { recordLLMObservation } from '../langfuse/index.js'
 import type { LangfuseSpan } from '../langfuse/index.js'
-import { convertMessagesToLangfuse, convertOutputToLangfuse, convertToolsToLangfuse } from '../langfuse/convert.js'
+import {
+  convertMessagesToLangfuse,
+  convertOutputToLangfuse,
+  convertToolsToLangfuse,
+} from '../langfuse/convert.js'
 import { withStreamingVCR, withVCR } from '../vcr.js'
 import { CLIENT_REQUEST_ID_HEADER, getAnthropicClient } from './client.js'
 import {
@@ -248,7 +252,6 @@ import {
   type NonNullableUsage,
 } from './logging.js'
 import {
-  CACHE_TTL_1HOUR_MS,
   checkResponseForCacheBreak,
   recordPromptState,
 } from './promptCacheBreakDetection.js'
@@ -442,7 +445,7 @@ function configureEffortParams(
     betas.push(EFFORT_BETA_HEADER)
   } else if (typeof effortValue === 'string') {
     // Send string effort level as is
-    outputConfig.effort = effortValue as "high" | "medium" | "low" | "max"
+    outputConfig.effort = effortValue as 'high' | 'medium' | 'low' | 'max'
     betas.push(EFFORT_BETA_HEADER)
   } else if (process.env.USER_TYPE === 'ant') {
     // Numeric effort override - ant-only (uses anthropic_internal)
@@ -506,10 +509,30 @@ export function getAPIMetadata() {
     }
   }
 
+  const deviceId = getOrCreateUserID()
+
+  // Third-party API providers (DeepSeek, etc.) validate user_id against
+  // ^[a-zA-Z0-9_-]+$ which rejects JSON strings containing {, ", :, etc.
+  // When using a non-Anthropic base URL, send only the device_id (hex string).
+  const baseUrl = process.env.ANTHROPIC_BASE_URL
+  const isThirdParty =
+    baseUrl &&
+    (() => {
+      try {
+        return new URL(baseUrl).host !== 'api.anthropic.com'
+      } catch {
+        return false
+      }
+    })()
+
+  if (isThirdParty) {
+    return { user_id: deviceId }
+  }
+
   return {
     user_id: jsonStringify({
       ...extra,
-      device_id: getOrCreateUserID(),
+      device_id: deviceId,
       // Only include OAuth account UUID when actively using OAuth authentication
       account_uuid: getOauthAccountInfo()?.accountUuid ?? '',
       session_id: getSessionId(),
@@ -541,13 +564,12 @@ export async function verifyApiKey(
           }),
         async anthropic => {
           const messages: MessageParam[] = [{ role: 'user', content: 'test' }]
-          // biome-ignore lint/plugin: API key verification is intentionally a minimal direct call
           await anthropic.beta.messages.create({
             model,
             max_tokens: 1,
             messages,
             temperature: 1,
-            ...(betas.length > 0 && { betas }),
+            ...(betas.length > 0 && { betas: betas.filter(Boolean) }),
             metadata: getAPIMetadata(),
             ...getExtraBodyParams(),
           })
@@ -616,7 +638,8 @@ export function userMessageToMessageParam(
     role: 'user',
     content: (Array.isArray(message.message!.content)
       ? [...message.message!.content]
-      : message.message!.content) as import('@anthropic-ai/sdk/resources/beta/messages/messages.js').BetaContentBlockParam[],
+      : message.message!
+          .content) as import('@anthropic-ai/sdk/resources/beta/messages/messages.js').BetaContentBlockParam[],
   }
 }
 
@@ -667,7 +690,9 @@ export function assistantMessageToMessageParam(
     content:
       typeof message.message!.content === 'string'
         ? message.message!.content
-        : message.message!.content!.map(stripGeminiProviderMetadata) as BetaContentBlockParam[],
+        : (message.message!.content!.map(
+            stripGeminiProviderMetadata,
+          ) as BetaContentBlockParam[]),
   }
 }
 
@@ -682,10 +707,8 @@ function stripGeminiProviderMetadata<T extends BetaContentBlockParam | string>(
   }
 
   const obj = contentBlock as unknown as Record<string, unknown>
-  const {
-    _geminiThoughtSignature: _unusedGeminiThoughtSignature,
-    ...rest
-  } = obj
+  const { _geminiThoughtSignature: _unusedGeminiThoughtSignature, ...rest } =
+    obj
   return rest as unknown as T
 }
 
@@ -878,7 +901,6 @@ export async function* executeNonStreamingRequest(
       )
 
       try {
-        // biome-ignore lint/plugin: non-streaming API call
         return await anthropic.beta.messages.create(
           {
             ...adjustedParams,
@@ -1215,10 +1237,15 @@ async function* queryModel(
     cacheEditingBetaHeader = betas.CACHE_EDITING_BETA_HEADER
     const featureEnabled = isCachedMicrocompactEnabled()
     const modelSupported = isModelSupportedForCacheEditing(options.model)
-    cachedMCEnabled = featureEnabled && modelSupported
+    // cachedMC requires a non-empty beta header; the CACHE_EDITING_BETA_HEADER
+    // constant is '' in this fork (upstream hasn't published the real value).
+    // Without it, cache_reference and cache_edits in the request body cause
+    // API 400: "tool_result.cache_reference: Extra inputs are not permitted".
+    const headerAvailable = !!cacheEditingBetaHeader
+    cachedMCEnabled = featureEnabled && modelSupported && headerAvailable
     const config = getCachedMCConfig()
     logForDebugging(
-      `Cached MC gate: enabled=${featureEnabled} modelSupported=${modelSupported} model=${options.model} supportedModels=${jsonStringify((config as any).supportedModels)}`,
+      `Cached MC gate: enabled=${featureEnabled} modelSupported=${modelSupported} headerAvailable=${headerAvailable} model=${options.model} supportedModels=${jsonStringify((config as Record<string, unknown>).supportedModels)}`,
     )
   }
 
@@ -1337,7 +1364,16 @@ async function* queryModel(
   // media stripping) but before Anthropic-specific logic (betas, thinking, caching).
   if (getAPIProvider() === 'openai') {
     const { queryModelOpenAI } = await import('./openai/index.js')
-    yield* queryModelOpenAI(messagesForAPI, systemPrompt, filteredTools, signal, options)
+    // OpenAI emulates Anthropic's dynamic tool loading client-side. It needs
+    // the full tool pool so ToolSearchTool can search deferred MCP tools that
+    // were intentionally filtered out of the initial API tool list above.
+    yield* queryModelOpenAI(
+      messagesForAPI,
+      systemPrompt,
+      tools,
+      signal,
+      options,
+    )
     return
   }
 
@@ -1356,7 +1392,13 @@ async function* queryModel(
 
   if (getAPIProvider() === 'grok') {
     const { queryModelGrok } = await import('./grok/index.js')
-    yield* queryModelGrok(messagesForAPI, systemPrompt, filteredTools, signal, options)
+    yield* queryModelGrok(
+      messagesForAPI,
+      systemPrompt,
+      filteredTools,
+      signal,
+      options,
+    )
     return
   }
 
@@ -1419,7 +1461,7 @@ async function* queryModel(
 
   const enablePromptCaching =
     options.enablePromptCaching ?? getPromptCachingEnabled(options.model)
-  const system = buildSystemPromptBlocks(systemPrompt, enablePromptCaching, {
+  let system = buildSystemPromptBlocks(systemPrompt, enablePromptCaching, {
     skipGlobalCacheForSystemPrompt: needsToolBasedCacheMarker,
     querySource: options.querySource,
   })
@@ -1439,7 +1481,7 @@ async function* queryModel(
       model: advisorModel,
     } as unknown as BetaToolUnion)
   }
-  const allTools = [...toolSchemas, ...extraToolSchemas]
+  let allTools = [...toolSchemas, ...extraToolSchemas]
 
   const isFastMode =
     isFastModeEnabled() &&
@@ -1484,20 +1526,6 @@ async function* queryModel(
     ) {
       cacheEditingHeaderLatched = true
       setCacheEditingHeaderLatched(true)
-    }
-  }
-
-  // Only latch from agentic queries so a classifier call doesn't flip the
-  // main thread's context_management mid-turn.
-  let thinkingClearLatched = getThinkingClearLatched() === true
-  if (!thinkingClearLatched && isAgenticQuery) {
-    const lastCompletion = getLastApiCompletionTimestamp()
-    if (
-      lastCompletion !== null &&
-      Date.now() - lastCompletion > CACHE_TTL_1HOUR_MS
-    ) {
-      thinkingClearLatched = true
-      setThinkingClearLatched(true)
     }
   }
 
@@ -1552,11 +1580,11 @@ async function* queryModel(
   let start = Date.now()
   let attemptNumber = 0
   const attemptStartTimes: number[] = []
-  let stream: Stream<BetaRawMessageStreamEvent> | undefined = undefined
-  let streamRequestId: string | null | undefined = undefined
-  let clientRequestId: string | undefined = undefined
+  let stream: Stream<BetaRawMessageStreamEvent> | undefined
+  let streamRequestId: string | null | undefined
+  let clientRequestId: string | undefined
   // eslint-disable-next-line eslint-plugin-n/no-unsupported-features/node-builtins -- Response is available in Node 18+ and is used by the SDK
-  let streamResponse: Response | undefined = undefined
+  let streamResponse: Response | undefined
 
   // Release all stream resources to prevent native memory leaks.
   // The Response object holds native TLS/socket buffers that live outside the
@@ -1576,6 +1604,39 @@ async function* queryModel(
   // inside it would cause the first call to steal edits from subsequent calls.
   const consumedCacheEdits = cachedMCEnabled ? consumePendingCacheEdits() : null
   const consumedPinnedEdits = cachedMCEnabled ? getPinnedCacheEdits() : []
+
+  // ---------------------------------------------------------------------------
+  // Serialization boundary: deep-clone heavy data so the closure below captures
+  // independent copies, not references to the originals. After this point the
+  // original variables (messagesForAPI, system, allTools) are nulled out so
+  // they can be GC'd even while the generator/closure is still alive (during
+  // long streaming responses or retry backoff).
+  // ---------------------------------------------------------------------------
+  const frozenMessages = addCacheBreakpoints(
+    messagesForAPI,
+    enablePromptCaching,
+    options.querySource,
+    cachedMCEnabled &&
+      getAPIProvider() === 'firstParty' &&
+      options.querySource === 'repl_main_thread',
+    consumedCacheEdits as any,
+    consumedPinnedEdits as any,
+    options.skipCacheWrite,
+  )
+  const frozenSystem = cloneDeep(system)
+  const frozenTools = cloneDeep(allTools)
+
+  // Pre-compute scalars that post-streaming code needs, so messagesForAPI
+  // can be released before streaming starts.
+  const preMessagesCount = messagesForAPI.length
+  const preMessagesTokenCount = tokenCountFromLastAPIResponse(messagesForAPI)
+
+  // Release originals for GC — the frozen* copies and pre-computed scalars
+  // are now the only references to this data inside the closure.
+  // After null-out, all downstream code uses frozen* or pre-computed scalars.
+  messagesForAPI = null!
+  system = null!
+  allTools = null!
 
   // Capture the betas sent in the last API request, including the ones that
   // were dynamically added, so we can log and send it to telemetry.
@@ -1642,7 +1703,7 @@ async function* queryModel(
     const hasThinking =
       thinkingConfig.type !== 'disabled' &&
       !isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_THINKING)
-    let thinking: BetaMessageStreamParams['thinking'] | undefined = undefined
+    let thinking: BetaMessageStreamParams['thinking'] | undefined
 
     // IMPORTANT: Do not change the adaptive-vs-budget thinking selection below
     // without notifying the model launch DRI and research. This is a sensitive
@@ -1679,11 +1740,8 @@ async function* queryModel(
     const contextManagement = getAPIContextManagement({
       hasThinking,
       isRedactThinkingActive: betasParams.includes(REDACT_THINKING_BETA_HEADER),
-      clearAllThinking: thinkingClearLatched,
+      clearAllThinking: false,
     })
-
-    const enablePromptCaching =
-      options.enablePromptCaching ?? getPromptCachingEnabled(retryContext.model)
 
     // Fast mode: header is latched session-stable (cache-safe), but
     // `speed='fast'` stays dynamic so cooldown still suppresses the actual
@@ -1715,15 +1773,13 @@ async function* queryModel(
       }
     }
 
-    // Cache editing beta: header is latched session-stable; useCachedMC
-    // (controls cache_edits body behavior) stays live so edits stop when
-    // the feature disables but the header doesn't flip.
-    const useCachedMC =
-      cachedMCEnabled &&
-      getAPIProvider() === 'firstParty' &&
-      options.querySource === 'repl_main_thread'
+    // Cache editing beta: header is latched session-stable.
+    // The useCachedMC gate (cache_edits body behavior) is baked into
+    // frozenMessages at the serialization boundary above, so this block
+    // only controls the beta header.
     if (
       cacheEditingHeaderLatched &&
+      cacheEditingBetaHeader &&
       getAPIProvider() === 'firstParty' &&
       options.querySource === 'repl_main_thread' &&
       !betasParams.includes(cacheEditingBetaHeader)
@@ -1740,23 +1796,20 @@ async function* queryModel(
       ? (options.temperatureOverride ?? 1)
       : undefined
 
-    lastRequestBetas = betasParams
+    // Filter out any empty-string beta headers before sending.
+    // Constants like CACHE_EDITING_BETA_HEADER or AFK_MODE_BETA_HEADER
+    // can be '' when their feature gate is off; an empty string in the
+    // betas array produces an invalid anthropic-beta header (400 error).
+    const filteredBetas = betasParams.filter(Boolean)
+    lastRequestBetas = filteredBetas
 
     return {
       model: normalizeModelStringForAPI(options.model),
-      messages: addCacheBreakpoints(
-        messagesForAPI,
-        enablePromptCaching,
-        options.querySource,
-        useCachedMC,
-        consumedCacheEdits as any,
-        consumedPinnedEdits as any,
-        options.skipCacheWrite,
-      ),
-      system,
-      tools: allTools,
+      messages: frozenMessages,
+      system: frozenSystem,
+      tools: frozenTools,
       tool_choice: options.toolChoice,
-      ...(useBetas && { betas: betasParams }),
+      ...(useBetas && { betas: filteredBetas }),
       metadata: getAPIMetadata(),
       max_tokens: maxOutputTokens,
       thinking,
@@ -1778,6 +1831,10 @@ async function* queryModel(
   // captures only primitives instead of paramsFromContext's full closure scope
   // (messagesForAPI, system, allTools, betas — the entire request-building
   // context), which would otherwise be pinned until the promise resolves.
+  // Also capture thinking params for Langfuse observability.
+  // Pass the entire thinking config object so all fields (type, budget_tokens,
+  // and any future additions) flow through without cherry-picking.
+  let langfuseThinking: BetaMessageStreamParams['thinking'] | undefined
   {
     const queryParams = paramsFromContext({
       model: options.model,
@@ -1785,8 +1842,10 @@ async function* queryModel(
     })
     const logMessagesLength = queryParams.messages.length
     const logBetas = useBetas ? (queryParams.betas ?? []) : []
-    const logThinkingType = queryParams.thinking?.type ?? 'disabled'
     const logEffortValue = queryParams.output_config?.effort
+    if (queryParams.thinking && queryParams.thinking.type !== 'disabled') {
+      langfuseThinking = queryParams.thinking
+    }
     void options.getToolPermissionContext().then(permissionContext => {
       logAPIQuery({
         model: options.model,
@@ -1796,7 +1855,7 @@ async function* queryModel(
         permissionMode: permissionContext.mode,
         querySource: options.querySource,
         queryTracking: options.queryTracking,
-        thinkingType: logThinkingType,
+        thinkingConfig,
         effortValue: logEffortValue,
         fastMode: isFastMode,
         previousRequestId,
@@ -1806,16 +1865,19 @@ async function* queryModel(
 
   const newMessages: AssistantMessage[] = []
   let ttftMs = 0
-  let partialMessage: BetaMessage | undefined = undefined
+  let partialMessage: BetaMessage | undefined
   const contentBlocks: (BetaContentBlock | ConnectorTextBlock)[] = []
+  // Accumulate streaming deltas in arrays to avoid O(n²) string concatenation.
+  // Joined and assigned to contentBlock fields at content_block_stop.
+  const streamingDeltas = new Map<number, string[]>()
   let usage: NonNullableUsage = EMPTY_USAGE
   let costUSD = 0
   let stopReason: BetaStopReason | null = null
   let didFallBackToNonStreaming = false
   let fallbackMessage: AssistantMessage | undefined
   let maxOutputTokens = 0
-  let responseHeaders: globalThis.Headers | undefined = undefined
-  let research: unknown = undefined
+  let responseHeaders: globalThis.Headers | undefined
+  let research: unknown
   let isFastModeRequest = isFastMode // Keep separate state as it may change if falling back
   let isAdvisorInProgress = false
 
@@ -1864,7 +1926,6 @@ async function* queryModel(
         // Use raw stream instead of BetaMessageStream to avoid O(n²) partial JSON parsing
         // BetaMessageStream calls partialParse() on every input_json_delta, which we don't need
         // since we handle tool input accumulation ourselves
-        // biome-ignore lint/plugin: main conversation loop handles attribution separately
         const result = await anthropic.beta.messages
           .create(
             { ...params, stream: true },
@@ -2095,6 +2156,8 @@ async function* queryModel(
                 }
                 break
             }
+            // Initialize delta accumulator for this content block
+            streamingDeltas.set(part.index, [])
             break
           case 'content_block_delta': {
             const contentBlock = contentBlocks[part.index]
@@ -2124,7 +2187,9 @@ async function* queryModel(
                 })
                 throw new Error('Content block is not a connector_text block')
               }
-              ;(contentBlock as { connector_text: string }).connector_text += delta.connector_text
+              streamingDeltas
+                .get(part.index)
+                ?.push(delta.connector_text as string)
             } else {
               switch (delta.type) {
                 case 'citations_delta':
@@ -2154,7 +2219,9 @@ async function* queryModel(
                     })
                     throw new Error('Content block input is not a string')
                   }
-                  contentBlock.input += delta.partial_json
+                  streamingDeltas
+                    .get(part.index)
+                    ?.push(delta.partial_json as string)
                   break
                 case 'text_delta':
                   if (contentBlock.type !== 'text') {
@@ -2168,7 +2235,7 @@ async function* queryModel(
                     })
                     throw new Error('Content block is not a text block')
                   }
-                  ;(contentBlock as { text: string }).text += delta.text
+                  streamingDeltas.get(part.index)?.push(delta.text!)
                   break
                 case 'signature_delta':
                   if (
@@ -2203,7 +2270,7 @@ async function* queryModel(
                     })
                     throw new Error('Content block is not a thinking block')
                   }
-                  ;(contentBlock as { thinking: string }).thinking += delta.thinking
+                  streamingDeltas.get(part.index)?.push(delta.thinking!)
                   break
               }
             }
@@ -2234,6 +2301,32 @@ async function* queryModel(
                   part.type as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
               })
               throw new Error('Message not found')
+            }
+            // Join accumulated streaming deltas into the contentBlock fields
+            // to avoid O(n²) string concatenation during streaming.
+            const deltas = streamingDeltas.get(part.index)
+            if (deltas && deltas.length > 0) {
+              const joined = deltas.join('')
+              switch (contentBlock.type) {
+                case 'text':
+                  ;(contentBlock as { text: string }).text = joined
+                  break
+                case 'thinking':
+                  ;(contentBlock as { thinking: string }).thinking = joined
+                  break
+                case 'tool_use':
+                case 'server_tool_use':
+                  contentBlock.input = joined
+                  break
+                default:
+                  if ((contentBlock.type as string) === 'connector_text') {
+                    ;(
+                      contentBlock as { connector_text: string }
+                    ).connector_text = joined
+                  }
+                  break
+              }
+              streamingDeltas.delete(part.index)
             }
             const m: AssistantMessage = {
               message: {
@@ -2295,7 +2388,10 @@ async function* queryModel(
             }
 
             // Update cost
-            const costUSDForPart = calculateUSDCost(resolvedModel, usage as unknown as BetaUsage)
+            const costUSDForPart = calculateUSDCost(
+              resolvedModel,
+              usage as unknown as BetaUsage,
+            )
             costUSD += addToTotalSessionCost(
               costUSDForPart,
               usage as unknown as BetaUsage,
@@ -2445,6 +2541,16 @@ async function* queryModel(
       const resp = streamResponse as unknown as Response | undefined
       if (resp) {
         extractQuotaStatusFromHeaders(resp.headers)
+        // Non-Anthropic providers that flow through this same client path
+        // (Bedrock) expose their own throttle headers — let their adapter
+        // overwrite the store with its bucket(s). Anthropic's adapter runs
+        // inside extractQuotaStatusFromHeaders.
+        if (getAPIProvider() === 'bedrock') {
+          updateProviderBuckets(
+            'bedrock',
+            bedrockAdapter.parseHeaders(resp.headers),
+          )
+        }
         // Store headers for gateway detection
         responseHeaders = resp.headers
       }
@@ -2538,6 +2644,9 @@ async function* queryModel(
           maxOutputTokens,
           thinkingType:
             thinkingConfig.type as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+          ...(thinkingConfig.type === 'enabled' && {
+            thinkingBudgetTokens: thinkingConfig.budgetTokens,
+          }),
           fallback_disabled: true,
           request_id: (streamRequestId ??
             'unknown') as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
@@ -2570,6 +2679,9 @@ async function* queryModel(
         maxOutputTokens,
         thinkingType:
           thinkingConfig.type as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+        ...(thinkingConfig.type === 'enabled' && {
+          thinkingBudgetTokens: thinkingConfig.budgetTokens,
+        }),
         fallback_disabled: false,
         request_id: (streamRequestId ??
           'unknown') as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
@@ -2686,6 +2798,9 @@ async function* queryModel(
         maxOutputTokens,
         thinkingType:
           thinkingConfig.type as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+        ...(thinkingConfig.type === 'enabled' && {
+          thinkingBudgetTokens: thinkingConfig.budgetTokens,
+        }),
         request_id:
           failedRequestId as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
         fallback_cause:
@@ -2767,8 +2882,8 @@ async function* queryModel(
         logAPIError({
           error,
           model: errorModel,
-          messageCount: messagesForAPI.length,
-          messageTokens: tokenCountFromLastAPIResponse(messagesForAPI),
+          messageCount: preMessagesCount,
+          messageTokens: preMessagesTokenCount,
           durationMs: Date.now() - start,
           durationMsIncludingRetries: Date.now() - startIncludingRetries,
           attempt: attemptNumber,
@@ -2789,7 +2904,10 @@ async function* queryModel(
 
         yield getAssistantMessageFromError(error, errorModel, {
           messages,
-          messagesForAPI,
+          messagesForAPI: frozenMessages as unknown as (
+            | UserMessage
+            | AssistantMessage
+          )[],
         })
         releaseStreamResources()
         return
@@ -2823,8 +2941,8 @@ async function* queryModel(
       logAPIError({
         error,
         model: errorModel,
-        messageCount: messagesForAPI.length,
-        messageTokens: tokenCountFromLastAPIResponse(messagesForAPI),
+        messageCount: preMessagesCount,
+        messageTokens: preMessagesTokenCount,
         durationMs: Date.now() - start,
         durationMsIncludingRetries: Date.now() - startIncludingRetries,
         attempt: attemptNumber,
@@ -2847,7 +2965,10 @@ async function* queryModel(
 
       yield getAssistantMessageFromError(error, errorModel, {
         messages,
-        messagesForAPI,
+        messagesForAPI: frozenMessages as unknown as (
+          | UserMessage
+          | AssistantMessage
+        )[],
       })
       releaseStreamResources()
       return
@@ -2865,10 +2986,14 @@ async function* queryModel(
     // message_delta handler before any yield. Fallback pushes to newMessages
     // then yields, so tracking must be here to survive .return() at the yield.
     if (fallbackMessage) {
-      const fallbackUsage = fallbackMessage.message.usage as BetaMessageDeltaUsage
+      const fallbackUsage = fallbackMessage.message
+        .usage as BetaMessageDeltaUsage
       usage = updateUsage(EMPTY_USAGE, fallbackUsage)
       stopReason = fallbackMessage.message.stop_reason as BetaStopReason
-      const fallbackCost = calculateUSDCost(resolvedModel, fallbackUsage as unknown as BetaUsage)
+      const fallbackCost = calculateUSDCost(
+        resolvedModel,
+        fallbackUsage as unknown as BetaUsage,
+      )
       costUSD += addToTotalSessionCost(
         fallbackCost,
         fallbackUsage as unknown as BetaUsage,
@@ -2899,14 +3024,19 @@ async function* queryModel(
   // Precompute scalars so the fire-and-forget .then() closure doesn't pin the
   // full messagesForAPI array (the entire conversation up to the context window
   // limit) until getToolPermissionContext() resolves.
-  const logMessageCount = messagesForAPI.length
-  const logMessageTokens = tokenCountFromLastAPIResponse(messagesForAPI)
+  // Note: messagesForAPI was nulled above (serialization boundary), so we use
+  // the pre-computed scalars captured before the null-out.
+  const logMessageCount = preMessagesCount
+  const logMessageTokens = preMessagesTokenCount
 
   // Record LLM observation in Langfuse (no-op if not configured)
   recordLLMObservation(options.langfuseTrace ?? null, {
     model: resolvedModel,
     provider: getAPIProvider(),
-    input: convertMessagesToLangfuse(messagesForAPI, systemPrompt),
+    input: convertMessagesToLangfuse(
+      frozenMessages as Parameters<typeof convertMessagesToLangfuse>[0],
+      systemPrompt,
+    ),
     output: convertOutputToLangfuse(newMessages),
     usage: {
       input_tokens: usage.input_tokens,
@@ -2918,12 +3048,15 @@ async function* queryModel(
     endTime: new Date(),
     completionStartTime: ttftMs > 0 ? new Date(start + ttftMs) : undefined,
     tools: convertToolsToLangfuse(toolSchemas as unknown[]),
+    thinking: langfuseThinking,
   })
 
   void options.getToolPermissionContext().then(permissionContext => {
     logAPISuccessAndDuration({
       model:
-        (newMessages[0]?.message.model as string | undefined) ?? partialMessage?.model ?? options.model,
+        (newMessages[0]?.message.model as string | undefined) ??
+        partialMessage?.model ??
+        options.model,
       preNormalizedModel: options.model,
       usage,
       start,
@@ -3229,6 +3362,7 @@ export function addCacheBreakpoints(
 
   // Add cache_reference to tool_result blocks that are within the cached prefix.
   // Must be done AFTER cache_edits insertion since that modifies content arrays.
+  // Note: this code only runs when useCachedMC=true (early return at line ~3202).
   if (enablePromptCaching) {
     // Find the last message containing a cache_control marker
     let lastCCMsg = -1

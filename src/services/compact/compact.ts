@@ -227,7 +227,7 @@ export function stripReinjectedAttachments(messages: Message[]): Message[] {
 }
 
 export const ERROR_MESSAGE_NOT_ENOUGH_MESSAGES =
-  'Not enough messages to compact.'
+  'Not enough messages to compact. Send a few more messages first, then try again.'
 const MAX_PTL_RETRIES = 3
 const PTL_RETRY_MARKER = '[earlier conversation truncated for compaction retry]'
 
@@ -267,7 +267,9 @@ export function truncateHeadForPTLRetry(
     let acc = 0
     dropCount = 0
     for (const g of groups) {
-      acc += roughTokenCountEstimationForMessages(g as Parameters<typeof roughTokenCountEstimationForMessages>[0])
+      acc += roughTokenCountEstimationForMessages(
+        g as Parameters<typeof roughTokenCountEstimationForMessages>[0],
+      )
       dropCount++
       if (acc >= tokenGap) break
     }
@@ -295,7 +297,7 @@ export function truncateHeadForPTLRetry(
 }
 
 export const ERROR_MESSAGE_PROMPT_TOO_LONG =
-  'Conversation too long. Press esc twice to go up a few messages and try again.'
+  'Conversation too long to summarize. Try /compact to manually clear conversation history, or start a new session with /clear.'
 export const ERROR_MESSAGE_USER_ABORT = 'API Error: Request was aborted.'
 export const ERROR_MESSAGE_INCOMPLETE_RESPONSE =
   'Compaction interrupted · This may be due to network issues — please try again.'
@@ -332,13 +334,31 @@ export type RecompactionInfo = {
  * Order: boundaryMarker, summaryMessages, messagesToKeep, attachments, hookResults
  */
 export function buildPostCompactMessages(result: CompactionResult): Message[] {
-  return [
-    result.boundaryMarker,
-    ...result.summaryMessages,
-    ...(result.messagesToKeep ?? []),
-    ...result.attachments,
-    ...result.hookResults,
-  ]
+  return ([result.boundaryMarker] as Message[]).concat(
+    result.summaryMessages,
+    stripToolUseResults(result.messagesToKeep),
+    result.attachments,
+    result.hookResults,
+  )
+}
+
+/** Release large tool result payloads from kept messages after compaction.
+ *  toolUseResult is only used for UI rendering, not API calls. */
+function stripToolUseResults(messages: Message[] | undefined): Message[] {
+  if (!messages) return []
+  return messages.map(msg => {
+    if (
+      msg.type === 'user' &&
+      'toolUseResult' in msg &&
+      msg.toolUseResult !== undefined
+    ) {
+      const { toolUseResult, ...rest } = msg as Message & {
+        toolUseResult: unknown
+      }
+      return rest as Message
+    }
+    return msg
+  })
 }
 
 /**
@@ -519,7 +539,7 @@ export async function compactConversation(
     }
 
     // Store the current file state before clearing
-    const preCompactReadFileState = cacheToObject(context.readFileState)
+    let preCompactReadFileState = cacheToObject(context.readFileState)
 
     // Clear the cache
     context.readFileState.clear()
@@ -541,6 +561,9 @@ export async function compactConversation(
       ),
       createAsyncAgentAttachmentsIfNeeded(context),
     ])
+    // Release the readFileState snapshot — it can hold 25+ MB of file content
+    preCompactReadFileState =
+      undefined as unknown as typeof preCompactReadFileState
 
     const postCompactFileAttachments: AttachmentMessage[] = [
       ...fileAttachments,
@@ -647,6 +670,8 @@ export async function compactConversation(
 
     // Extract compaction API usage metrics
     const compactionUsage = getTokenUsage(summaryResponse)
+    // Release the full API response — it holds content blocks + usage metadata
+    summaryResponse = undefined as unknown as typeof summaryResponse
 
     const querySourceForEvent =
       recompactionInfo?.querySource ?? context.options.querySource ?? 'unknown'
@@ -762,7 +787,7 @@ export async function compactConversation(
     context.setStreamMode?.('requesting')
     context.setResponseLength?.(() => 0)
     context.onCompactProgress?.({ type: 'compact_end' })
-    context.setSDKStatus?.("" as SDKStatus)
+    context.setSDKStatus?.('' as SDKStatus)
   }
 }
 
@@ -920,7 +945,7 @@ export async function partialCompactConversation(
     }
 
     // Store the current file state before clearing
-    const preCompactReadFileState = cacheToObject(context.readFileState)
+    let preCompactReadFileState = cacheToObject(context.readFileState)
     context.readFileState.clear()
     context.loadedNestedMemoryPaths?.clear()
     // Intentionally NOT resetting sentSkillNames — see compactConversation()
@@ -935,6 +960,9 @@ export async function partialCompactConversation(
       ),
       createAsyncAgentAttachmentsIfNeeded(context),
     ])
+    // Release the readFileState snapshot — it can hold 25+ MB of file content
+    preCompactReadFileState =
+      undefined as unknown as typeof preCompactReadFileState
 
     const postCompactFileAttachments: AttachmentMessage[] = [
       ...fileAttachments,
@@ -990,6 +1018,8 @@ export async function partialCompactConversation(
       summaryResponse,
     ])
     const compactionUsage = getTokenUsage(summaryResponse)
+    // Release the full API response — it holds content blocks + usage metadata
+    summaryResponse = undefined as unknown as typeof summaryResponse
 
     logEvent('tengu_partial_compact', {
       preCompactTokenCount,
@@ -1105,7 +1135,7 @@ export async function partialCompactConversation(
     context.setStreamMode?.('requesting')
     context.setResponseLength?.(() => 0)
     context.onCompactProgress?.({ type: 'compact_end' })
-    context.setSDKStatus?.("" as SDKStatus)
+    context.setSDKStatus?.('' as SDKStatus)
   }
 }
 
@@ -1326,14 +1356,25 @@ async function streamCompactSummary({
           agents: context.options.agentDefinitions.activeAgents,
           mcpTools: [],
           effortValue: appState.effortValue,
+          langfuseTrace: context.langfuseTrace,
         },
       })
       const streamIter = streamingGen[Symbol.asyncIterator]()
       let next = await streamIter.next()
 
       while (!next.done) {
-        const event = next.value as StreamEvent | AssistantMessage | SystemAPIErrorMessage
-        const streamEvent = event as { type: string; event: { type: string; content_block: { type: string }; delta: { type: string; text: string } } }
+        const event = next.value as
+          | StreamEvent
+          | AssistantMessage
+          | SystemAPIErrorMessage
+        const streamEvent = event as {
+          type: string
+          event: {
+            type: string
+            content_block: { type: string }
+            delta: { type: string; text: string }
+          }
+        }
 
         if (
           !hasStartedStreaming &&
